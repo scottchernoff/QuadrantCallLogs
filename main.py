@@ -3,29 +3,46 @@ import base64
 import requests
 import pandas as pd
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-# --- 1️⃣ Get access token ---
+# -------------------------------
+# 1️⃣ Load .env variables
+# -------------------------------
+load_dotenv()
+
+ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
+ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
+
+if not ZOOM_CLIENT_ID or not ZOOM_CLIENT_SECRET:
+    raise Exception("Please set ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET in your .env file")
+
+# -------------------------------
+# 2️⃣ Get Server-to-Server OAuth token
+# -------------------------------
 def get_access_token():
-    client_id = os.getenv("ZOOM_CLIENT_ID")
-    client_secret = os.getenv("ZOOM_CLIENT_SECRET")
-
-    credentials = f"{client_id}:{client_secret}"
-    encoded_credentials = base64.b64encode(credentials.encode()).decode()
+    credentials = f"{ZOOM_CLIENT_ID}:{ZOOM_CLIENT_SECRET}"
+    encoded = base64.b64encode(credentials.encode()).decode()
 
     token_url = "https://zoom.us/oauth/token?grant_type=client_credentials"
-    r = requests.post(token_url, headers={"Authorization": f"Basic {encoded_credentials}"})
-    r.raise_for_status()
-    return r.json()["access_token"]
+    response = requests.post(token_url, headers={"Authorization": f"Basic {encoded}"})
 
-# --- 2️⃣ Get today's external outbound call logs ---
+    response.raise_for_status()
+    token = response.json().get("access_token")
+    if not token:
+        raise Exception("Access token not returned")
+    return token
+
+# -------------------------------
+# 3️⃣ Pull external outbound call logs
+# -------------------------------
 def get_call_logs():
     token = get_access_token()
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Today in ISO8601
-    today = datetime.now(timezone.utc)
-    from_time = today.replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
-    to_time = today.replace(hour=23, minute=59, second=59, microsecond=0).isoformat().replace("+00:00", "Z")
+    # Today in UTC
+    now = datetime.now(timezone.utc)
+    from_time = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
+    to_time = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat().replace("+00:00", "Z")
 
     all_calls = []
     page_number = 1
@@ -37,33 +54,35 @@ def get_call_logs():
             f"from={from_time}&to={to_time}&direction=outbound&call_type=external"
             f"&page_size={page_size}&page_number={page_number}"
         )
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
 
-        if "call_logs" not in data or not data["call_logs"]:
+        response = requests.get(url, headers=headers)
+        if response.status_code in [401, 403]:
+            raise Exception(f"{response.status_code} error: Check token/scopes/installation")
+        
+        data = response.json()
+        calls = data.get("call_logs", [])
+        if not calls:
             break
 
-        all_calls.extend(data["call_logs"])
-
-        # If fewer than page_size, we are done
-        if len(data["call_logs"]) < page_size:
+        all_calls.extend(calls)
+        if len(calls) < page_size:
             break
 
         page_number += 1
 
-    print(f"Total external outbound calls today: {len(all_calls)}")
+    print(f"Fetched {len(all_calls)} external outbound calls for today")
     return all_calls
 
-# --- 3️⃣ Aggregate per user ---
+# -------------------------------
+# 4️⃣ Aggregate per user
+# -------------------------------
 def aggregate_per_user(calls):
     if not calls:
-        print("No external calls today")
-        return None
+        return pd.DataFrame()
 
     df = pd.DataFrame(calls)
     df["caller_name"] = df["caller_name"].fillna("Unknown")
-    df["department"] = df.get("department", "")  # Some calls may not have department
+    df["department"] = df.get("department", "")
 
     summary = df.groupby("caller_name").agg(
         total_calls=pd.NamedAgg(column="id", aggfunc="count"),
@@ -73,19 +92,28 @@ def aggregate_per_user(calls):
 
     return summary
 
-# --- 4️⃣ Save to CSV ---
-def save_csv(df):
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    file_path = f"data/external_outbound_calls_{today_str}.csv"
+# -------------------------------
+# 5️⃣ Save CSV (overwrite daily)
+# -------------------------------
+def save_csv(df, folder="data"):
+    os.makedirs(folder, exist_ok=True)
+    file_path = os.path.join(folder, "external_outbound_calls_today.csv")
     df.to_csv(file_path, index=False)
     print(f"Saved aggregated call data to {file_path}")
 
-# --- 5️⃣ Main ---
+# -------------------------------
+# 6️⃣ Main
+# -------------------------------
 def main():
-    calls = get_call_logs()
-    summary = aggregate_per_user(calls)
-    if summary is not None:
-        save_csv(summary)
+    try:
+        calls = get_call_logs()
+        summary = aggregate_per_user(calls)
+        if summary.empty:
+            print("No external outbound calls found today.")
+        else:
+            save_csv(summary)
+    except Exception as e:
+        print(f"ERROR: {e}")
 
 if __name__ == "__main__":
     main()
