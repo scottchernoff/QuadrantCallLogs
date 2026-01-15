@@ -1,119 +1,116 @@
 import os
-import base64
 import requests
 import pandas as pd
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+from datetime import datetime, timedelta
 
 # -------------------------------
-# 1️⃣ Load .env variables
+# CONFIGURATION
 # -------------------------------
-load_dotenv()
 
-ZOOM_CLIENT_ID = os.getenv("ZOOM_CLIENT_ID")
-ZOOM_CLIENT_SECRET = os.getenv("ZOOM_CLIENT_SECRET")
+# Put your Account ID here
+ZOOM_ACCOUNT_ID = "no1aFaVMQsSbU6exGpf2lA"  # <--- Replace this with your Zoom Account ID
 
-if not ZOOM_CLIENT_ID or not ZOOM_CLIENT_SECRET:
-    raise Exception("Please set ZOOM_CLIENT_ID and ZOOM_CLIENT_SECRET in your .env file")
+# GitHub Actions or local environment
+ZOOM_CLIENT_ID = os.environ.get("ZOOM_CLIENT_ID")
+ZOOM_CLIENT_SECRET = os.environ.get("ZOOM_CLIENT_SECRET")
+
+# CSV output path
+CSV_PATH = "external_outbound_calls.csv"
 
 # -------------------------------
-# 2️⃣ Get Server-to-Server OAuth token
+# FUNCTIONS
 # -------------------------------
+
 def get_access_token():
-    credentials = f"{ZOOM_CLIENT_ID}:{ZOOM_CLIENT_SECRET}"
-    encoded = base64.b64encode(credentials.encode()).decode()
+    """Get a fresh Server-to-Server OAuth token."""
+    url = "https://zoom.us/oauth/token?grant_type=client_credentials"
+    auth = (ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET)
+    headers = {"Authorization": f"Basic {requests.auth._basic_auth_str(*auth)}"}
+    r = requests.post(url, headers=headers)
+    r.raise_for_status()
+    token_data = r.json()
+    return token_data["access_token"]
 
-    token_url = "https://zoom.us/oauth/token?grant_type=client_credentials"
-    response = requests.post(token_url, headers={"Authorization": f"Basic {encoded}"})
-
-    response.raise_for_status()
-    token = response.json().get("access_token")
-    if not token:
-        raise Exception("Access token not returned")
-    return token
-
-# -------------------------------
-# 3️⃣ Pull external outbound call logs
-# -------------------------------
-def get_call_logs():
-    token = get_access_token()
+def get_users(token):
+    """Fetch all users in your Zoom account."""
+    url = "https://api.zoom.us/v2/users"
     headers = {"Authorization": f"Bearer {token}"}
-
-    # Today in UTC
-    now = datetime.now(timezone.utc)
-    from_time = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z")
-    to_time = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat().replace("+00:00", "Z")
-
-    all_calls = []
+    users = []
     page_number = 1
-    page_size = 300
 
     while True:
-        url = (
-            f"https://api.zoom.us/v2/phone/call_logs?"
-            f"from={from_time}&to={to_time}&direction=outbound&call_type=external"
-            f"&page_size={page_size}&page_number={page_number}"
-        )
-
-        response = requests.get(url, headers=headers)
-        if response.status_code in [401, 403]:
-            raise Exception(f"{response.status_code} error: Check token/scopes/installation")
-        
-        data = response.json()
-        calls = data.get("call_logs", [])
-        if not calls:
+        params = {"page_size": 300, "page_number": page_number}
+        r = requests.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        data = r.json()
+        users.extend(data.get("users", []))
+        if page_number * 300 >= data.get("total_records", 0):
             break
-
-        all_calls.extend(calls)
-        if len(calls) < page_size:
-            break
-
         page_number += 1
+    return users
 
-    print(f"Fetched {len(all_calls)} external outbound calls for today")
+def get_call_logs(token, account_id, start_date, end_date):
+    """Get all external outbound calls for your account ID between start_date and end_date."""
+    url = f"https://api.zoom.us/v2/phone/call_logs"
+    headers = {"Authorization": f"Bearer {token}"}
+    all_calls = []
+
+    users = get_users(token)
+    for user in users:
+        user_id = user["id"]
+        page_number = 1
+        while True:
+            params = {
+                "account_id": account_id,
+                "user_id": user_id,
+                "from": start_date + "T00:00:00Z",
+                "to": end_date + "T23:59:59Z",
+                "direction": "outbound",
+                "call_type": "external",
+                "page_size": 300,
+                "page_number": page_number
+            }
+            r = requests.get(url, headers=headers, params=params)
+            r.raise_for_status()
+            data = r.json()
+            calls = data.get("call_logs", [])
+            if not calls:
+                break
+            all_calls.extend(calls)
+            if page_number * 300 >= data.get("total_records", 0):
+                break
+            page_number += 1
+
     return all_calls
 
-# -------------------------------
-# 4️⃣ Aggregate per user
-# -------------------------------
 def aggregate_per_user(calls):
+    """Aggregate total calls and total talk time per user."""
     if not calls:
-        return pd.DataFrame()
+        print("No calls found for today.")
+        return
 
     df = pd.DataFrame(calls)
-    df["caller_name"] = df["caller_name"].fillna("Unknown")
-    df["department"] = df.get("department", "")
+    if "caller_name" not in df.columns:
+        df["caller_name"] = df.get("caller_id", "Unknown")
 
     summary = df.groupby("caller_name").agg(
         total_calls=pd.NamedAgg(column="id", aggfunc="count"),
-        total_talk_time=pd.NamedAgg(column="duration", aggfunc="sum"),
-        department=pd.NamedAgg(column="department", aggfunc=lambda x: x.mode()[0] if not x.mode().empty else "")
+        total_talk_time=pd.NamedAgg(column="duration", aggfunc="sum")
     ).reset_index()
 
-    return summary
+    summary.to_csv(CSV_PATH, index=False)
+    print(f"Aggregated call data saved to {CSV_PATH}")
 
 # -------------------------------
-# 5️⃣ Save CSV (overwrite daily)
+# MAIN
 # -------------------------------
-def save_csv(df, folder="data"):
-    os.makedirs(folder, exist_ok=True)
-    file_path = os.path.join(folder, "external_outbound_calls_today.csv")
-    df.to_csv(file_path, index=False)
-    print(f"Saved aggregated call data to {file_path}")
 
-# -------------------------------
-# 6️⃣ Main
-# -------------------------------
 def main():
-    try:
-        calls = get_call_logs()
-        summary = aggregate_per_user(calls)
-        if summary.empty:
-            print("No external outbound calls found today.")
-        else:
-            save_csv(summary)
-    except Exception as e:
-        print(f"ERROR: {e}")
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    token = get_access_token()
+    calls = get_call_logs(token, ZOOM_ACCOUNT_ID, today, today)
+    print(f"Total external outbound calls today: {len(calls)}")
+    aggregate_per_user(calls)
 
 if __name__ == "__main__":
     main()
