@@ -1,16 +1,16 @@
 import os
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
 
-# Put your Account ID here
-ZOOM_ACCOUNT_ID = "no1aFaVMQsSbU6exGpf2lA"  # <--- Replace this with your Zoom Account ID
+# Your Zoom Account ID (replace with your actual ID)
+ZOOM_ACCOUNT_ID = "no1aFaVMQsSbU6exGpf2lA"
 
-# GitHub Actions or local environment
+# Get Client ID and Secret from environment variables (GitHub Actions or local .env)
 ZOOM_CLIENT_ID = os.environ.get("ZOOM_CLIENT_ID")
 ZOOM_CLIENT_SECRET = os.environ.get("ZOOM_CLIENT_SECRET")
 
@@ -22,17 +22,17 @@ CSV_PATH = "external_outbound_calls.csv"
 # -------------------------------
 
 def get_access_token():
-    """Get a fresh Server-to-Server OAuth token."""
+    """Get a fresh Server-to-Server OAuth token from Zoom"""
     url = "https://zoom.us/oauth/token?grant_type=client_credentials"
-    auth = (ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET)
-    headers = {"Authorization": f"Basic {requests.auth._basic_auth_str(*auth)}"}
-    r = requests.post(url, headers=headers)
+    # Use HTTPBasicAuth for S2S OAuth
+    r = requests.post(url, auth=requests.auth.HTTPBasicAuth(ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET))
     r.raise_for_status()
     token_data = r.json()
+    print("Access token retrieved successfully")
     return token_data["access_token"]
 
 def get_users(token):
-    """Fetch all users in your Zoom account."""
+    """Get all users in the Zoom account"""
     url = "https://api.zoom.us/v2/users"
     headers = {"Authorization": f"Bearer {token}"}
     users = []
@@ -47,11 +47,12 @@ def get_users(token):
         if page_number * 300 >= data.get("total_records", 0):
             break
         page_number += 1
+    print(f"Retrieved {len(users)} users")
     return users
 
 def get_call_logs(token, account_id, start_date, end_date):
-    """Get all external outbound calls for your account ID between start_date and end_date."""
-    url = f"https://api.zoom.us/v2/phone/call_logs"
+    """Get all external outbound calls for each user in the account"""
+    url = "https://api.zoom.us/v2/phone/call_logs"
     headers = {"Authorization": f"Bearer {token}"}
     all_calls = []
 
@@ -81,15 +82,18 @@ def get_call_logs(token, account_id, start_date, end_date):
                 break
             page_number += 1
 
+    print(f"Total external outbound calls retrieved: {len(all_calls)}")
     return all_calls
 
 def aggregate_per_user(calls):
-    """Aggregate total calls and total talk time per user."""
+    """Aggregate total calls and total talk time per user"""
     if not calls:
         print("No calls found for today.")
         return
 
     df = pd.DataFrame(calls)
+
+    # Ensure caller_name column exists
     if "caller_name" not in df.columns:
         df["caller_name"] = df.get("caller_id", "Unknown")
 
@@ -106,10 +110,9 @@ def aggregate_per_user(calls):
 # -------------------------------
 
 def main():
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     token = get_access_token()
     calls = get_call_logs(token, ZOOM_ACCOUNT_ID, today, today)
-    print(f"Total external outbound calls today: {len(calls)}")
     aggregate_per_user(calls)
 
 if __name__ == "__main__":
